@@ -1,11 +1,23 @@
 """Core benchmark runner.
 
 One run = iterate full dataset N epochs with real GPU compute (ResNet-18 forward pass).
+
+Cold vs Warm semantics
+----------------------
+Before every repeat, the OS page cache is dropped (via drop_caches()).
+This makes epoch 0 of each repeat a **cold** read — data must come from physical
+disk.  Subsequent epochs (1, 2 …) are **warm**: the OS page cache is populated,
+so all disks converge to RAM speed and GPU starvation disappears.
+
+The expected pattern:
+  Cold epoch  — NVMe: high GPU util;  HDD: very low GPU util  (disk bottleneck)
+  Warm epochs — all disks converge to near-identical GPU util  (RAM masks disk)
 """
 
+import subprocess
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
 import pandas as pd
@@ -21,6 +33,7 @@ class BenchmarkConfig:
     num_workers: int = 4
     dry_run: bool = False
     n_repeats: int = 3          # repeat full experiment N times, report mean ± std
+    drop_caches: bool = True    # drop OS page cache before each repeat
 
 
 @dataclass
@@ -28,62 +41,143 @@ class RunResult:
     disk_name: str
     repeat_idx: int
     epoch: int
+    cold: bool                  # True = cache was dropped before this repeat
     elapsed_s: float
     throughput_img_s: float
     gpu_stats: dict
     disk_stats: dict
 
 
+# ---------------------------------------------------------------------------
+# Cache management
+# ---------------------------------------------------------------------------
+
+def drop_page_cache(dry_run: bool = False) -> bool:
+    """Drop OS page cache to ensure cold disk reads at epoch 0.
+
+    Requires passwordless sudo for the drop_caches command.
+    Run scripts/setup_sudoers.sh once to configure this.
+
+    Returns True if successful (or dry_run), False on failure (warning only).
+    """
+    if dry_run:
+        print("  [dry-run] Would drop page cache "
+              "(sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches')")
+        return True
+
+    try:
+        result = subprocess.run(
+            ["sudo", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+        if result.returncode == 0:
+            print("  Page cache dropped (cold read guaranteed).")
+            return True
+        warnings.warn(
+            f"drop_caches failed (rc={result.returncode}): {result.stderr.strip()}\n"
+            "Run scripts/setup_sudoers.sh to configure passwordless sudo.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    except Exception as exc:
+        warnings.warn(
+            f"drop_caches error: {exc}\n"
+            "Continuing without cache drop — epoch 0 may not be cold.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Dry-run synthetic data (cold/warm physics modelled)
+# ---------------------------------------------------------------------------
+
+# Cold  = epoch 0 after cache drop: disk is the bottleneck
+# Warm  = epoch 1+ : OS page cache serves the data, disk speed irrelevant
+_COLD_PARAMS = {
+    #          (thr_img_s, gpu_util%, disk_read_MB_s)
+    "nvme": (305.0, 68.0, 478.0),   # NVMe cold: fast enough, mild starvation
+    "ssd":  (265.0, 61.0, 298.0),   # SATA SSD cold: noticeable starvation
+    "hdd":  ( 35.0, 17.0,  88.0),   # HDD cold: severe GPU starvation
+}
+_WARM_PARAMS = {
+    # Warm: data served from RAM (~10 GB/s+), disk reads drop to near-zero
+    # All disks converge because they all read from the same page cache
+    "nvme": (318.0, 72.0,  4.0),
+    "ssd":  (314.0, 71.0,  3.5),
+    "hdd":  (311.0, 70.0,  3.0),
+}
+
+
 def _dry_run_epoch(epoch: int, disk_name: str, repeat_idx: int) -> RunResult:
-    """Return a plausible synthetic RunResult without real I/O or GPU."""
+    """Return a plausible synthetic RunResult modelling cold/warm cache physics."""
     import random
     rng = random.Random(hash(f"{disk_name}-{repeat_idx}-{epoch}") & 0xFFFFFFFF)
 
-    speed_map = {"nvme": 310.0, "ssd": 280.0, "hdd": 90.0}
-    base_thr = speed_map.get(disk_name, 200.0)
-    throughput = max(1.0, rng.gauss(base_thr, base_thr * 0.03))
+    is_cold = (epoch == 0)
+    params = _COLD_PARAMS if is_cold else _WARM_PARAMS
+    base_thr, base_gpu, base_disk = params.get(disk_name, (200.0, 55.0, 200.0))
+
+    noise = lambda base, pct=0.04: max(0.1, rng.gauss(base, base * pct))  # noqa: E731
+
+    throughput = noise(base_thr)
     n_images = 20 * 200  # 4000 images
     elapsed = n_images / throughput
-
-    gpu_base = {"nvme": 70.0, "ssd": 67.0, "hdd": 30.0}.get(disk_name, 50.0)
-    disk_base = {"nvme": 480.0, "ssd": 305.0, "hdd": 95.0}.get(disk_name, 200.0)
+    gpu_util = min(100.0, max(0.0, noise(base_gpu, 0.06)))
+    disk_read = max(0.0, noise(base_disk, 0.08))
 
     return RunResult(
         disk_name=disk_name,
         repeat_idx=repeat_idx,
         epoch=epoch,
+        cold=is_cold,
         elapsed_s=elapsed,
         throughput_img_s=throughput,
         gpu_stats={
-            "mean_gpu_util": rng.gauss(gpu_base, 3.0),
-            "max_gpu_util": min(100.0, gpu_base + rng.uniform(10.0, 20.0)),
-            "std_gpu_util": rng.uniform(2.0, 6.0),
-            "mean_mem_util": rng.gauss(45.0, 4.0),
-            "max_mem_util": min(100.0, 55.0 + rng.uniform(5.0, 15.0)),
-            "mean_mem_used_mb": rng.gauss(3500.0, 150.0),
-            "n_samples": int(elapsed / 0.5),
+            "mean_gpu_util": gpu_util,
+            "max_gpu_util": min(100.0, gpu_util + rng.uniform(8.0, 18.0)),
+            "std_gpu_util": rng.uniform(2.0, 7.0),
+            "mean_mem_util": max(0.0, rng.gauss(44.0, 4.0)),
+            "max_mem_util": min(100.0, 56.0 + rng.uniform(4.0, 14.0)),
+            "mean_mem_used_mb": max(0.0, rng.gauss(3500.0, 150.0)),
+            "n_samples": max(1, int(elapsed / 0.5)),
         },
         disk_stats={
-            "mean_read_mb_s": rng.gauss(disk_base, disk_base * 0.05),
-            "max_read_mb_s": disk_base * 1.15,
-            "mean_write_mb_s": rng.gauss(5.0, 1.0),
+            "mean_read_mb_s": disk_read,
+            "max_read_mb_s": disk_read * rng.uniform(1.05, 1.20),
+            "mean_write_mb_s": max(0.0, rng.gauss(3.0, 1.0)),
             "total_read_mb": n_images * 150 / 1024,
         },
     )
 
 
+# ---------------------------------------------------------------------------
+# Real benchmark
+# ---------------------------------------------------------------------------
+
 def run_single(cfg: BenchmarkConfig, repeat_idx: int) -> List[RunResult]:
     """Run one full benchmark (all epochs) for a given repeat index.
 
+    Drops page cache first so epoch 0 is a cold read.
+
     Steps per epoch:
-      1. Build torchvision ImageFolder DataLoader (real I/O)
+      1. Build torchvision ImageFolder DataLoader (real I/O, num_workers, pin_memory)
+         - transforms: Resize(256), CenterCrop(224), ToTensor(), Normalize(imagenet)
       2. Load ResNet-18 onto GPU in eval() mode
-      3. Forward-pass every batch, recording GPU + disk stats
+         - real forward pass → genuine GPU utilization; no grad overhead
+      3. For each epoch:
+         a. Start GPUMonitor + DiskMonitor
+         b. Iterate all batches → move to GPU → model(images) → synchronize
+         c. Stop monitors, record RunResult
     """
     if cfg.dry_run:
         results = []
         for epoch in range(cfg.epochs):
-            time.sleep(0.05)   # simulate a tiny bit of work
+            time.sleep(0.05)
             results.append(_dry_run_epoch(epoch, cfg.disk_name, repeat_idx))
         return results
 
@@ -149,8 +243,9 @@ def run_single(cfg: BenchmarkConfig, repeat_idx: int) -> List[RunResult]:
             disk_stats = disk_mon.stop()
 
             throughput = n_images / elapsed
+            cold_tag = "[COLD]" if epoch == 0 else "[warm]"
             print(
-                f"  [{cfg.disk_name}] repeat={repeat_idx} epoch={epoch} "
+                f"  [{cfg.disk_name}] repeat={repeat_idx} epoch={epoch}{cold_tag} "
                 f"elapsed={elapsed:.1f}s thr={throughput:.1f} img/s "
                 f"gpu={gpu_stats['mean_gpu_util']:.1f}% "
                 f"disk={disk_stats['mean_read_mb_s']:.1f} MB/s"
@@ -160,6 +255,7 @@ def run_single(cfg: BenchmarkConfig, repeat_idx: int) -> List[RunResult]:
                 disk_name=cfg.disk_name,
                 repeat_idx=repeat_idx,
                 epoch=epoch,
+                cold=(epoch == 0),
                 elapsed_s=elapsed,
                 throughput_img_s=throughput,
                 gpu_stats=gpu_stats,
@@ -170,17 +266,29 @@ def run_single(cfg: BenchmarkConfig, repeat_idx: int) -> List[RunResult]:
 
 
 def run_benchmark(cfg: BenchmarkConfig) -> pd.DataFrame:
-    """Run cfg.n_repeats times, aggregate all results into a DataFrame."""
+    """Run cfg.n_repeats times with cache drop before each repeat.
+
+    Cache drop before each repeat guarantees:
+    - epoch 0 = cold (disk must serve all reads → bottleneck visible on HDD)
+    - epoch 1+ = warm (OS page cache populated → all disks converge)
+    """
     all_rows = []
 
     for repeat in range(cfg.n_repeats):
         print(f"\n--- [{cfg.disk_name}] Repeat {repeat + 1}/{cfg.n_repeats} ---")
+
+        # Drop caches before every repeat so epoch 0 is always cold
+        if cfg.drop_caches:
+            drop_page_cache(dry_run=cfg.dry_run)
+
         results = run_single(cfg, repeat_idx=repeat)
+
         for r in results:
             row = {
                 "disk": r.disk_name,
                 "repeat": r.repeat_idx,
                 "epoch": r.epoch,
+                "cold": r.cold,
                 "elapsed_s": r.elapsed_s,
                 "throughput_img_s": r.throughput_img_s,
                 "mean_gpu_util": r.gpu_stats.get("mean_gpu_util", 0.0),

@@ -116,6 +116,9 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--only", nargs="+", choices=["nvme", "ssd", "hdd"],
                         help="Run only specified disks")
+    parser.add_argument("--no-drop-caches", action="store_true",
+                        help="Skip page-cache drop before each repeat "
+                             "(epoch 0 will NOT be a guaranteed cold read)")
     args = parser.parse_args()
 
     results_dir = Path(__file__).parent.parent / "results"
@@ -146,6 +149,7 @@ def main() -> None:
             num_workers=args.num_workers,
             dry_run=args.dry_run,
             n_repeats=args.repeats,
+            drop_caches=not args.no_drop_caches,
         )
 
         df = run_benchmark(cfg)
